@@ -1,0 +1,247 @@
+trigger:
+  - main
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  - group: 'devops-variable-group' # Create this group in ADO Library with secrets like ACR_PASSWORD, DB_PASSWORD, etc.
+  - name: dockerRegistryServiceConnection
+    value: 'myAcrConnection' # Replace with your Service Connection Name
+  - name: containerRegistry
+    value: 'myacr.azurecr.io' # Replace with your ACR Login Server
+  - name: imageRepositoryBackend
+    value: 'backend'
+  - name: imageRepositoryFrontend
+    value: 'frontend'
+  - name: tag
+    value: '$(Build.BuildId)'
+  - name: vmImageName
+    value: 'ubuntu-latest'
+
+stages:
+  - stage: Build_Test_Scan
+    displayName: 'Build, Test, and Scan'
+    jobs:
+      # -----------------------------------------------------------------------
+      # BACKEND JOB
+      # -----------------------------------------------------------------------
+      - job: Backend
+        displayName: 'Backend: Build, Test, Scan'
+        pool:
+          vmImage: $(vmImageName)
+        steps:
+          - task: JavaToolInstaller@0
+            inputs:
+              versionSpec: '17'
+              jdkArchitectureOption: 'x64'
+              jdkSourceOption: 'PreInstalled'
+            displayName: 'Install Java 17'
+
+          # 1. Unit Tests, Cucumber Tests, Checkstyle, Code Coverage
+          - task: Maven@3
+            displayName: 'Maven Verify (Unit, Integration, Checkstyle, JaCoCo)'
+            inputs:
+              mavenPomFile: 'backend/pom.xml'
+              goals: 'verify'
+              options: '-Dmaven.test.failure.ignore=true' # Continue on error as requested
+              publishJUnitResults: true
+              testResultsFiles: '**/surefire-reports/TEST-*.xml'
+              codeCoverageToolOption: 'JaCoCo'
+              codeCoverageClassFilesDirectories: 'backend/target/classes'
+              codeCoverageSourceDirectories: 'backend/src/main/java'
+              checkStyleRunAnalysis: true
+              pmdRunAnalysis: false
+              findBugsRunAnalysis: false
+
+          # 2. Publish Code Coverage Results
+          - task: PublishCodeCoverageResults@2
+            displayName: 'Publish Code Coverage'
+            inputs:
+              summaryFileLocation: '$(System.DefaultWorkingDirectory)/backend/target/site/jacoco/jacoco.xml'
+              failIfCoverageEmpty: false
+
+          # 3. SAST Scan (SonarQube - Placeholder)
+          # Note: Requires a SonarQube service connection and server
+          - script: |
+              echo "Running SAST Scan (SonarQube)..."
+              # mvn sonar:sonar -Dsonar.projectKey=backend -Dsonar.host.url=http://your-sonar-server
+            displayName: 'SAST Scan (Placeholder)'
+            continueOnError: true
+
+          # 4. Build Docker Image
+          - task: Docker@2
+            displayName: 'Build Backend Image'
+            inputs:
+              command: build
+              repository: $(imageRepositoryBackend)
+              dockerfile: 'backend/Dockerfile'
+              containerRegistry: $(dockerRegistryServiceConnection)
+              tags: |
+                $(tag)
+                latest
+
+          # 5. Container Scan (Trivy)
+          - script: |
+              sudo apt-get install wget apt-transport-https gnupg lsb-release
+              wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+              echo deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main | sudo tee -a /etc/apt/sources.list.d/trivy.list
+              sudo apt-get update
+              sudo apt-get install trivy
+              trivy image --exit-code 0 --severity HIGH,CRITICAL --format template --template "@contrib/html.tpl" -o trivy-backend-report.html $(containerRegistry)/$(imageRepositoryBackend):$(tag)
+            displayName: 'Trivy Container Scan'
+            continueOnError: true
+
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish Trivy Report'
+            inputs:
+              PathtoPublish: 'trivy-backend-report.html'
+              ArtifactName: 'TrivyReportBackend'
+
+          # 6. Push Docker Image
+          - task: Docker@2
+            displayName: 'Push Backend Image'
+            inputs:
+              command: push
+              repository: $(imageRepositoryBackend)
+              containerRegistry: $(dockerRegistryServiceConnection)
+              tags: |
+                $(tag)
+                latest
+
+      # -----------------------------------------------------------------------
+      # FRONTEND JOB
+      # -----------------------------------------------------------------------
+      - job: Frontend
+        displayName: 'Frontend: Build, Test, Scan'
+        pool:
+          vmImage: $(vmImageName)
+        steps:
+          - task: NodeTool@0
+            inputs:
+              versionSpec: '18.x'
+            displayName: 'Install Node.js'
+
+          - script: |
+              cd frontend
+              npm install
+            displayName: 'npm install'
+
+          # 1. Linting (SAST)
+          - script: |
+              cd frontend
+              npm run lint -- --format json --output-file eslint-report.json || true
+            displayName: 'ESLint (SAST)'
+            continueOnError: true
+
+          # 2. Unit Tests with Coverage
+          - script: |
+              cd frontend
+              npm run test:coverage
+            displayName: 'Vitest (Unit Tests & Coverage)'
+            continueOnError: true
+
+          - task: PublishTestResults@2
+            displayName: 'Publish Test Results'
+            inputs:
+              testResultsFormat: 'JUnit'
+              testResultsFiles: '**/junit.xml' 
+              searchFolder: '$(System.DefaultWorkingDirectory)/frontend'
+              mergeTestResults: true
+              failTaskOnFailedTests: false
+
+          # 3. Build Docker Image
+          - task: Docker@2
+            displayName: 'Build Frontend Image'
+            inputs:
+              command: build
+              repository: $(imageRepositoryFrontend)
+              dockerfile: 'frontend/Dockerfile'
+              containerRegistry: $(dockerRegistryServiceConnection)
+              tags: |
+                $(tag)
+                latest
+
+          # 4. Container Scan (Trivy)
+          - script: |
+              # Trivy already installed in previous job if on same agent, but assume new agent
+              sudo apt-get install wget apt-transport-https gnupg lsb-release
+              wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+              echo deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main | sudo tee -a /etc/apt/sources.list.d/trivy.list
+              sudo apt-get update
+              sudo apt-get install trivy
+              trivy image --exit-code 0 --severity HIGH,CRITICAL --format template --template "@contrib/html.tpl" -o trivy-frontend-report.html $(containerRegistry)/$(imageRepositoryFrontend):$(tag)
+            displayName: 'Trivy Container Scan'
+            continueOnError: true
+
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish Trivy Report'
+            inputs:
+              PathtoPublish: 'trivy-frontend-report.html'
+              ArtifactName: 'TrivyReportFrontend'
+
+          # 5. Push Docker Image
+          - task: Docker@2
+            displayName: 'Push Frontend Image'
+            inputs:
+              command: push
+              repository: $(imageRepositoryFrontend)
+              containerRegistry: $(dockerRegistryServiceConnection)
+              tags: |
+                $(tag)
+                latest
+
+  # -----------------------------------------------------------------------
+  # DEPLOY STAGE
+  # -----------------------------------------------------------------------
+  - stage: Deploy
+    displayName: 'Deploy to AKS'
+    dependsOn: Build_Test_Scan
+    jobs:
+      - job: Deploy
+        pool:
+          vmImage: $(vmImageName)
+        steps:
+          - task: HelmInstaller@0
+            inputs:
+              helmVersion: '2.14.1'
+              installKubectl: true
+
+          - task: HelmDeploy@0
+            displayName: 'Helm Upgrade'
+            inputs:
+              connectionType: 'Kubernetes Service Connection'
+              kubernetesServiceConnection: 'myAksConnection' # Replace with your AKS Service Connection
+              command: 'upgrade'
+              chartType: 'FilePath'
+              chartPath: 'helm/hexademo-chart'
+              releaseName: 'hexademo'
+              overrideValues: 'backend.image.tag=$(tag),frontend.image.tag=$(tag)'
+              arguments: '--create-namespace --namespace hexademo'
+
+  # -----------------------------------------------------------------------
+  # DAST SCAN STAGE
+  # -----------------------------------------------------------------------
+  - stage: DAST_Scan
+    displayName: 'DAST Scan (OWASP ZAP)'
+    dependsOn: Deploy
+    jobs:
+      - job: ZAP_Scan
+        pool:
+          vmImage: $(vmImageName)
+        steps:
+          - script: |
+              # Run OWASP ZAP Docker container
+              # Target URL should be your App Gateway IP or DNS
+              TARGET_URL="http://YOUR_APP_GATEWAY_IP" 
+              
+              chmod 777 $(System.DefaultWorkingDirectory)
+              docker run -v $(System.DefaultWorkingDirectory):/zap/wrk/:rw -t owasp/zap2docker-stable zap-full-scan.py -t $TARGET_URL -g gen.conf -r zap-report.html || true
+            displayName: 'Run OWASP ZAP Scan'
+            continueOnError: true
+
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish ZAP Report'
+            inputs:
+              PathtoPublish: 'zap-report.html'
+              ArtifactName: 'ZapReport'
