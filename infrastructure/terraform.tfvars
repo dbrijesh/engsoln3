@@ -1,0 +1,5 @@
+rgname                  = "hexademo-rg"
+location                = "canadacentral"
+service_principal_name = "hexademo-aks-sp"
+keyvault_name           = "hexademo-kv"
+SUB_ID                  = "<your-subscription-id>"
